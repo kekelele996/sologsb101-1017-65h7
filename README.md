@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | **按角色拆成两份库，各持自己那份**：吹制库 `gbglassblow-craft`（作品/工序/检验）与排产库 `gbglassblow-schedule`（窑炉/料液/退火），跨库只读副本对齐；旧单库 `gbglassblow` 仅用于一次性迁移 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -73,9 +73,10 @@ sologsb101-1017/
         ├── stores/             # furnaceStore.ts pieceStore.ts annealStore.ts
         ├── components/common/  # StageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
+        ├── db/                 # roleDb.ts（按角色拆分的两份本地库 + 迁移 + 副本对齐 + 按侧重试）
         ├── pages/              # 5 个模块页面
         ├── router/index.ts     # 路由表 + ROUTES 常量
-        └── utils/              # thermal.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # thermal.ts db.ts（门面，re-export db/roleDb.ts）export.ts seed.ts id.ts
 ```
 
 ---
@@ -98,28 +99,40 @@ sologsb101-1017/
 
 ## 五、数据存储说明
 
-* **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
-* **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
-  * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
-  * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
-    * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
-    * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
-    * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
-    * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
-* **表结构**：
+* **持久化方案**：IndexedDB，通过 Dexie 封装（`src/db/roleDb.ts`）。
+* **两份本地库，各持自己那份**（吹制组与排产员不再共用一份库，避免同时保存时晚到的一方把对方刚填的内容带走）：
 
-  | 表 | 主键 | 主要索引 |
-  | --- | --- | --- |
-  | `furnaces` | id | code, type, state, fuelType, createdAt, updatedAt |
-  | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
-  | `pieces` | id | batchId, state, artist, **craft**, name |
-  | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
-  | `inspects` | id | pieceId, date, result, inspector |
+  | 库名 | 归属角色 | 拥有的表（可写） | 只读副本（对齐对侧） |
+  | --- | --- | --- | --- |
+  | `gbglassblow-craft` | 吹制组 | `pieces`、`steps`、`inspects` | `furnaces`、`batches` |
+  | `gbglassblow-schedule` | 排产员 | `furnaces`、`batches`、`anneals` | `pieces`、`steps` |
 
-* **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
-  幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
+  * 吹制组只记**作品的工序道次与温度时长**（`steps` 的 seq / tempC / durationMin / operator），
+    排产员只排**窑位、入窑时间与曲线段**（`anneals` 的 kilnSlot / inAt / curveSeg）；两侧只写自己库内的表，
+    从根上杜绝「窑位一变，工序温度与操作人回到旧值；工序重排又把入窑时间冲掉」。
+  * 跨库只读副本由 `reconcileReplicas` 对齐（吹制 → 排产：pieces / steps；排产 → 吹制：furnaces / batches），
+    业务代码不直接改副本，因此不会双向覆盖。
+* **保存失败按本侧重试**：每侧写入都经 `withRetry` 事务重试（默认 3 次、退避递增）；仍失败时把错误记入该侧
+  `saveState` 并保留重放闭包，页面给出「重试吹制侧 / 排产侧保存」按钮。一侧失败**绝不回滚或覆盖对侧已确认的数据**。
+* **旧数据按归属迁移**：首次打开时检测旧单库 `gbglassblow`，有数据则按归属一次性迁移到两边
+  （作品/工序/检验 → 吹制库；窑炉/料液/退火 → 排产库），再对齐副本；迁移标记存 localStorage，只执行一次。
+* **存档格式版本**：`DB_SCHEMA_VERSION = 2`（JSON 存档的 `name` 仍沿用 `gbglassblow`，保证旧备份可导入）。
+* **表结构**（各库独立，主键与索引一致）：
+
+  | 表 | 主键 | 主要索引 | 所在库 |
+  | --- | --- | --- | --- |
+  | `furnaces` | id | code, type, state, fuelType, createdAt, updatedAt | 排产库（吹制库只读副本） |
+  | `batches` | id | furnaceId, colorCode, meltDate, remainKg | 排产库（吹制库只读副本） |
+  | `pieces` | id | batchId, state, artist, craft, name | 吹制库（排产库只读副本） |
+  | `steps` | id | pieceId, [pieceId+seq], seq, state, name | 吹制库（排产库只读副本） |
+  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg | 排产库 |
+  | `inspects` | id | pieceId, date, result, inspector | 吹制库 |
+
+* **排产受阻看得见「卡在哪一件」**：退火编排页顶部「排产受阻」面板逐件列出不能排产的作品——
+  前序工序未完成（标明第几道、当前状态）或窑位时间窗重叠（标明撞在哪件、哪个窑位、哪个时段），
+  排产员一眼看到卡点，而不是只得到笼统的冲突提示。
+* **首屏演示数据**：`initDatabase()` 打开两侧库后，若旧库无数据且两侧库为空，则调用 `utils/seed.ts` 播种到各自归属表，
+  再对齐副本；幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
   * 3 台窑炉（KILN-01 熔化炉 / KILN-02 坩埚炉 / AN-01 退火窑）；
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
   * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
@@ -162,6 +175,8 @@ npm run preview      # 预览 dist 产物
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
+* **排产受阻可视化**：`/annealing` 顶部「排产受阻」面板逐件列出卡点——前序未完成（标明第几道 / 当前状态）或窑位时间窗重叠（标明撞在哪件 / 哪个窑位 / 哪个时段），排产员看得见「卡在哪一件」。
+* **两侧数据隔离**：吹制组只写吹制库（工序道次、温度时长、操作人），排产员只写排产库（窑位、入窑时间、曲线段）；保存失败按本侧重试，对侧已确认数据不受影响。
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
   判定不合格时生成返工提示，**原始工序记录完整保留**。
 * **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。

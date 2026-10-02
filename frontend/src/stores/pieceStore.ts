@@ -1,6 +1,8 @@
 /**
- * 作品与工序状态管理（Pinia）
+ * 作品与工序状态管理（Pinia · 吹制侧）
  * 维护作品列表、当前作品与当前作品的工序；工序状态由 db.syncPieceState 联动作品状态。
+ * 数据落在吹制库 gbglassblow-craft（craftDb），保存失败可按本侧重试，
+ * 不影响排产库已确认的退火编排数据。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -8,18 +10,20 @@ import { liveQuery } from 'dexie'
 import type { Craft, Piece, PieceDraft, PieceState } from '../types/piece'
 import type { Step, StepDraft } from '../types/step'
 import {
+  craftDb,
   DB_SCHEMA_VERSION,
   ROW_REVISION,
   countAll,
-  db,
   initDatabase,
   putPiece,
   putStep,
   removePiece,
   removeStep,
   reorderSteps,
+  retrySave,
+  saveState,
   syncPieceState,
-} from '../utils/db'
+} from '../db/roleDb'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
 
@@ -65,6 +69,15 @@ export const usePieceStore = defineStore('piece', () => {
   const currentPieceId = ref<string | null>(readCurrentPieceId())
   const filters = reactive<PieceFilters>({ ...EMPTY_FILTERS })
 
+  /** 吹制侧保存失败信息（按本侧重试，不影响排产侧已确认数据） */
+  const saveError = computed<string>(() => saveState.craft.error)
+  const canRetrySave = computed<boolean>(() => saveState.craft.canRetry)
+  const retryingSave = computed<boolean>(() => saveState.craft.retrying)
+
+  async function retryLastSave(): Promise<void> {
+    await retrySave('craft')
+  }
+
   const currentPiece = computed<Piece | null>(
     () => pieces.value.find((row) => row.id === currentPieceId.value) ?? null
   )
@@ -103,7 +116,7 @@ export const usePieceStore = defineStore('piece', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [pieceRows, stepRows] = await Promise.all([db.pieces.toArray(), db.steps.toArray()])
+          const [pieceRows, stepRows] = await Promise.all([craftDb.pieces.toArray(), craftDb.steps.toArray()])
           return { pieceRows, stepRows }
         }).subscribe({
           next: ({ pieceRows, stepRows }) => {
@@ -308,6 +321,10 @@ export const usePieceStore = defineStore('piece', () => {
     currentPiece,
     visiblePieces,
     inProgressCount,
+    saveError,
+    canRetrySave,
+    retryingSave,
+    retryLastSave,
     stepsOf,
     progressOf,
     loadAll,

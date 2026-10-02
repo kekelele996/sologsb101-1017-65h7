@@ -14,7 +14,8 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
+import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
+import { craftDb } from '@/db/roleDb'
 import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { INSPECT_RESULT_OPTIONS, type Inspect, type InspectDraft, type InspectResult } from '@/types/inspect'
@@ -25,7 +26,7 @@ const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 const furnaceStore = useFurnaceStore()
 
-const { rows, loading, create, update, remove } = useIdbTable<Inspect>(db.inspects, { sortByUpdatedAt: false })
+const { rows, loading, create, update, remove } = useIdbTable<Inspect>(craftDb.inspects, { sortByUpdatedAt: false })
 
 const dialogVisible = ref(false)
 const submitting = ref(false)

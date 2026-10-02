@@ -12,13 +12,15 @@ import {
   ROW_REVISION,
   consumeBatch,
   countAll,
-  db,
   initDatabase,
   putBatch,
   putFurnace,
   removeBatch,
   removeFurnace,
-} from '../utils/db'
+  retrySave,
+  saveState,
+  scheduleDb,
+} from '../db/roleDb'
 import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
@@ -61,6 +63,15 @@ export const useFurnaceStore = defineStore('furnace', () => {
   const lastMessage = ref('')
   const revision = ref(0)
   const filters = reactive<FurnaceFilters>({ ...EMPTY_FILTERS })
+
+  /** 排产侧保存失败信息（按本侧重试，不影响吹制侧已确认数据） */
+  const saveError = computed<string>(() => saveState.schedule.error)
+  const canRetrySave = computed<boolean>(() => saveState.schedule.canRetry)
+  const retryingSave = computed<boolean>(() => saveState.schedule.retrying)
+
+  async function retryLastSave(): Promise<void> {
+    await retrySave('schedule')
+  }
 
   const meltingFurnaces = computed<Furnace[]>(() =>
     furnaces.value.filter((row) => row.type === '熔化炉' || row.type === '坩埚炉')
@@ -115,9 +126,9 @@ export const useFurnaceStore = defineStore('furnace', () => {
         subscribed = true
         liveQuery(async () => {
           const [furnaceRows, batchRows, pieceRows] = await Promise.all([
-            db.furnaces.toArray(),
-            db.batches.toArray(),
-            db.pieces.toArray(),
+            scheduleDb.furnaces.toArray(),
+            scheduleDb.batches.toArray(),
+            scheduleDb.pieces.toArray(),
           ])
           return { furnaceRows, batchRows, pieceRows }
         }).subscribe({
@@ -268,6 +279,10 @@ export const useFurnaceStore = defineStore('furnace', () => {
     filters,
     lastMessage,
     revision,
+    saveError,
+    canRetrySave,
+    retryingSave,
+    retryLastSave,
     meltingFurnaces,
     annealingFurnaces,
     lowRemainBatches,

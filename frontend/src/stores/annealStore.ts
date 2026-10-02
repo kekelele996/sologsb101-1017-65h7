@@ -1,6 +1,9 @@
 /**
- * 退火窑位与曲线状态管理（Pinia）
+ * 退火窑位与曲线状态管理（Pinia · 排产侧）
  * 维护窑位占用表与退火曲线段；窑位冲突时禁止提交，出炉即回写作品状态。
+ * 数据落在排产库 gbglassblow-schedule（scheduleDb），保存失败可按本侧重试，
+ * 不影响吹制库已确认的工序温度、时长与操作人。
+ * 排产页可看到「卡在哪一件」：前序工序未完成或时间窗重叠的作品会被明确列出。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -8,14 +11,17 @@ import { liveQuery } from 'dexie'
 import type { Anneal, AnnealDraft, AnnealState, CurveSeg } from '../types/anneal'
 import { ANNEAL_STATE_FLOW } from '../types/anneal'
 import type { Piece } from '../types/piece'
+import type { Step } from '../types/step'
 import {
-  ROW_REVISION,
   advanceAnnealState,
-  db,
   initDatabase,
   putAnneal,
   removeAnneal,
-} from '../utils/db'
+  retrySave,
+  saveState,
+  scheduleDb,
+} from '../db/roleDb'
+import { buildStepProgress } from '../hooks/useStepProgress'
 import {
   checkSlotConflict,
   formatHours,
@@ -24,7 +30,7 @@ import {
   totalAnnealHours,
   type SlotConflict,
 } from '../utils/thermal'
-import { nowIso, nowLocalInput, uuid } from '../utils/id'
+import { nowLocalInput, uuid } from '../utils/id'
 
 /** 退火筛选条件 */
 export interface AnnealFilters {
@@ -48,6 +54,17 @@ export interface SlotOccupancy {
   occupied: boolean
 }
 
+/** 排产受阻作品：前序未完成 或 时间窗重叠 */
+export interface BlockedPiece {
+  pieceId: string
+  pieceName: string
+  craft: string
+  /** prerequisite = 前序工序未完成；conflict = 窑位时间窗重叠 */
+  kind: 'prerequisite' | 'conflict'
+  /** 受阻原因（含具体道次或冲突对象） */
+  reason: string
+}
+
 const EMPTY_FILTERS: AnnealFilters = { keyword: '', state: 'all', curveSeg: 'all', kilnCode: 'all' }
 
 let subscribed = false
@@ -55,12 +72,23 @@ let subscribed = false
 export const useAnnealStore = defineStore('anneal', () => {
   const anneals = ref<Anneal[]>([])
   const pieces = ref<Piece[]>([])
+  /** 工序进度只读副本（来自吹制库），用于排产前判断前序是否完成 */
+  const steps = ref<Step[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
   const lastMessage = ref('')
   const revision = ref(0)
   const filters = reactive<AnnealFilters>({ ...EMPTY_FILTERS })
+
+  /** 排产侧保存失败信息（按本侧重试，不影响吹制侧已确认数据） */
+  const saveError = computed<string>(() => saveState.schedule.error)
+  const canRetrySave = computed<boolean>(() => saveState.schedule.canRetry)
+  const retryingSave = computed<boolean>(() => saveState.schedule.retrying)
+
+  async function retryLastSave(): Promise<void> {
+    await retrySave('schedule')
+  }
 
   const kilnCodes = computed<string[]>(() => {
     const set = new Set<string>()
@@ -122,6 +150,68 @@ export const useAnnealStore = defineStore('anneal', () => {
     })
   })
 
+  /**
+   * 排产受阻作品清单：前序工序未完成（看得见卡在哪一道）或窑位时间窗重叠（看得见撞在哪件）。
+   * 排产员据此知道「卡在哪一件」，而不是只得到一个笼统的冲突提示。
+   */
+  const blockedPieces = computed<BlockedPiece[]>(() => {
+    const result: BlockedPiece[] = []
+    for (const piece of pieces.value) {
+      const progress = buildStepProgress(piece.id, steps.value)
+      if (!progress.allDone) {
+        result.push({
+          pieceId: piece.id,
+          pieceName: piece.name,
+          craft: piece.craft,
+          kind: 'prerequisite',
+          reason:
+            progress.total === 0
+              ? '尚未登记任何吹制工序'
+              : `前序第 ${progress.currentSeq} 道「${progress.currentName}」未完成（当前 ${progress.done}/${progress.total} 道）`,
+        })
+        continue
+      }
+      // 前序已完成：检查该作品既有退火记录是否与他人在同一窑位时间窗重叠
+      const ownAnneals = anneals.value.filter((row) => row.pieceId === piece.id)
+      let conflictReason = ''
+      for (const own of ownAnneals) {
+        const conflict = checkSlotConflict(
+          anneals.value,
+          {
+            id: own.id,
+            kilnSlot: own.kilnSlot,
+            inAt: own.inAt,
+            outAt: own.outAt,
+            curveSeg: own.curveSeg,
+            pieceId: own.pieceId,
+          },
+          wallThicknessOf,
+          own.id,
+        )
+        if (conflict.conflict) {
+          const other = pieces.value.find((item) => item.id === conflict.withPieceId)
+          conflictReason = `窑位 ${own.kilnSlot} 时间窗与「${other?.name ?? '已删除作品'}」重叠（${own.inAt.replace('T', ' ')} 起）`
+          break
+        }
+      }
+      if (conflictReason !== '') {
+        result.push({
+          pieceId: piece.id,
+          pieceName: piece.name,
+          craft: piece.craft,
+          kind: 'conflict',
+          reason: conflictReason,
+        })
+      }
+    }
+    return result
+  })
+
+  /** 前序已完成且无冲突、可立即排产的作品 */
+  const schedulablePieceIds = computed<Set<string>>(
+    () => new Set(pieces.value.filter((piece) => !blockedPieces.value.some((b) => b.pieceId === piece.id)).map((piece) => piece.id)),
+  )
+
   /** 某件作品的窑位冲突检测（编辑时排除自身） */
   function conflictOf(
     candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
@@ -144,12 +234,17 @@ export const useAnnealStore = defineStore('anneal', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [annealRows, pieceRows] = await Promise.all([db.anneals.toArray(), db.pieces.toArray()])
-          return { annealRows, pieceRows }
+          const [annealRows, pieceRows, stepRows] = await Promise.all([
+            scheduleDb.anneals.toArray(),
+            scheduleDb.pieces.toArray(),
+            scheduleDb.steps.toArray(),
+          ])
+          return { annealRows, pieceRows, stepRows }
         }).subscribe({
-          next: ({ annealRows, pieceRows }) => {
+          next: ({ annealRows, pieceRows, stepRows }) => {
             anneals.value = [...annealRows].sort((a, b) => a.inAt.localeCompare(b.inAt))
             pieces.value = pieceRows
+            steps.value = [...stepRows].sort((a, b) => a.pieceId.localeCompare(b.pieceId) || a.seq - b.seq)
             loading.value = false
             ready.value = true
             error.value = ''
@@ -187,7 +282,7 @@ export const useAnnealStore = defineStore('anneal', () => {
       lastMessage.value = conflict.message
       return null
     }
-    const stamp = nowIso()
+    const stamp = nowLocalInput()
     const row: Anneal = {
       id: uuid('anneal'),
       pieceId: draft.pieceId,
@@ -198,7 +293,7 @@ export const useAnnealStore = defineStore('anneal', () => {
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: ROW_REVISION,
+      revision: 2,
     }
     await putAnneal(row)
     revision.value += 1
@@ -258,12 +353,19 @@ export const useAnnealStore = defineStore('anneal', () => {
   return {
     anneals,
     pieces,
+    steps,
     loading,
     ready,
     error,
     filters,
     lastMessage,
     revision,
+    saveError,
+    canRetrySave,
+    retryingSave,
+    retryLastSave,
+    blockedPieces,
+    schedulablePieceIds,
     kilnCodes,
     allSlots,
     occupancy,

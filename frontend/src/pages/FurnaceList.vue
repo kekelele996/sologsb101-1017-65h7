@@ -281,6 +281,22 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-alert>
 
+    <el-alert
+      v-if="store.saveError !== ''"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      title="排产侧保存失败，可按本侧重试（吹制组已确认的工序数据不受影响）"
+      :description="store.saveError"
+    >
+      <div class="retry-row">
+        <el-button size="small" type="primary" :loading="store.retryingSave" @click="store.retryLastSave()">
+          重试排产侧保存
+        </el-button>
+      </div>
+    </el-alert>
+
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
@@ -612,6 +628,10 @@ function handleFurnaceFilter(key: string, value: string): void {
   margin: 0 0 12px;
   font-size: 13px;
   color: #5b6b7a;
+}
+
+.retry-row {
+  margin-top: 8px;
 }
 
 .mt-14 {

@@ -89,6 +89,13 @@ const stats = computed(() => ({
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
 }))
 
+const blockedPrerequisiteCount = computed(
+  () => annealStore.blockedPieces.filter((item) => item.kind === 'prerequisite').length,
+)
+const blockedConflictCount = computed(
+  () => annealStore.blockedPieces.filter((item) => item.kind === 'conflict').length,
+)
+
 onMounted(() => {
   void annealStore.loadAll()
   void pieceStore.loadAll()
@@ -207,6 +214,43 @@ function handleFilterChange(key: string, value: string): void {
       class="mb-14"
       :title="annealStore.lastMessage"
     />
+
+    <el-alert
+      v-if="annealStore.saveError !== ''"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`排产侧保存失败，可按本侧重试（吹制组已确认的工序数据不受影响）`"
+      :description="annealStore.saveError"
+    >
+      <div class="retry-row">
+        <el-button size="small" type="primary" :loading="annealStore.retryingSave" @click="annealStore.retryLastSave()">
+          重试排产侧保存
+        </el-button>
+      </div>
+    </el-alert>
+
+    <el-card v-if="annealStore.blockedPieces.length > 0" shadow="never" class="mb-14">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">排产受阻：{{ annealStore.blockedPieces.length }} 件作品暂时排不下</span>
+          <el-tag type="warning" effect="dark">前序未完成 {{ blockedPrerequisiteCount }} · 时间窗重叠 {{ blockedConflictCount }}</el-tag>
+        </div>
+      </template>
+      <div class="blocked-grid">
+        <div v-for="item in annealStore.blockedPieces" :key="item.pieceId" class="blocked-card" :class="`is-${item.kind}`">
+          <div class="blocked-card__head">
+            <el-tag size="small" :type="item.kind === 'prerequisite' ? 'warning' : 'danger'" effect="dark">
+              {{ item.kind === 'prerequisite' ? '前序未完成' : '时间窗重叠' }}
+            </el-tag>
+            <el-link type="primary" @click="$router.push(`/pieces/${item.pieceId}/steps`)">{{ item.pieceName }}</el-link>
+          </div>
+          <div class="blocked-card__reason">{{ item.reason }}</div>
+          <div class="blocked-card__sub">工艺：{{ item.craft }}</div>
+        </div>
+      </div>
+    </el-card>
 
     <el-card shadow="never">
       <template #header>
@@ -498,5 +542,49 @@ function handleFilterChange(key: string, value: string): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.retry-row {
+  margin-top: 8px;
+}
+
+.blocked-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.blocked-card {
+  border: 1px solid #f0c4a4;
+  border-left: 4px solid #e6a23c;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fffaf4;
+}
+
+.blocked-card.is-conflict {
+  border-color: #f5b7b1;
+  border-left-color: #e74c3c;
+  background: #fdf3f2;
+}
+
+.blocked-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.blocked-card__reason {
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1d2b3a;
+  line-height: 1.5;
+}
+
+.blocked-card__sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #8b95a1;
 }
 </style>

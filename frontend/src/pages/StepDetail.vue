@@ -239,6 +239,22 @@ function goAnnealing(): void {
         :description="`理论退火时长 ${formatHours(totalAnnealHours(piece?.wallThicknessMm ?? 4))}（升温 / 保温 / 缓冷三段合计）。`"
       />
 
+      <el-alert
+        v-if="pieceStore.saveError !== ''"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="吹制侧保存失败，可按本侧重试（排产员已确认的窑位与入窑时间不受影响）"
+        :description="pieceStore.saveError"
+      >
+        <div class="retry-row">
+          <el-button size="small" type="primary" :loading="pieceStore.retryingSave" @click="pieceStore.retryLastSave()">
+            重试吹制侧保存
+          </el-button>
+        </div>
+      </el-alert>
+
       <el-card shadow="never">
         <template #header>
           <div class="card-header">
@@ -480,5 +496,9 @@ function goAnnealing(): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.retry-row {
+  margin-top: 8px;
 }
 </style>

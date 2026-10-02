@@ -1,9 +1,13 @@
 /**
- * 演示数据播种（幂等）
+ * 演示数据构造（幂等，纯函数）
  * 父 → 子 → 孙三层链路：窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验
  * 所有 id 固定，保证 /pieces/:id/steps 深链一定命中真实作品与工序。
+ *
+ * 本文件只负责「构造数据」，不直接写库；落库由 db/roleDb.ts 按归属写入两侧库：
+ * 排产侧（窑炉、料液、退火）→ gbglassblow-schedule，
+ * 吹制侧（作品、工序、检验）→ gbglassblow-craft，副本再由 reconcile 对齐。
  */
-import { db, ROW_REVISION } from './db'
+import { ROW_REVISION } from '../db/roleDb'
 import type { Furnace } from '../types/furnace'
 import type { GlassBatch } from '../types/batch'
 import type { Piece } from '../types/piece'
@@ -33,10 +37,17 @@ function wrap<T>(row: Omit<T, 'createdAt' | 'updatedAt' | 'revision'>): T {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION } as T
 }
 
-export async function seedDatabase(): Promise<void> {
-  const exists = await db.furnaces.count()
-  if (exists > 0) return
+export interface SeedData {
+  furnaces: Furnace[]
+  batches: GlassBatch[]
+  pieces: Piece[]
+  steps: Step[]
+  anneals: Anneal[]
+  inspects: Inspect[]
+}
 
+/** 构造全部演示数据（纯函数，不触碰数据库） */
+export function buildSeedData(): SeedData {
   // ---------------- 窑炉（2 台熔化/坩埚炉 + 1 台退火窑） ----------------
   const furnaces: Furnace[] = [
     wrap<Furnace>({ id: SEED_IDS.furnaceMelt, code: 'KILN-01', type: '熔化炉', maxTempC: 1250, fuelType: '燃气', state: '运行' }),
@@ -90,19 +101,12 @@ export async function seedDatabase(): Promise<void> {
     wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
   ]
 
-  // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------
+  // ---------------- 出炉检验（3 条，含不合格与返工后复检合格） ----------------
   const inspects: Inspect[] = [
     wrap<Inspect>({ id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, result: '合格', defectNote: '', inspector: '吴岚', date: '2026-09-28' }),
     wrap<Inspect>({ id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, result: '裂纹', defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。', inspector: '吴岚', date: '2026-09-22' }),
     wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
   ]
 
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await db.furnaces.bulkPut(furnaces)
-    await db.batches.bulkPut(batches)
-    await db.pieces.bulkPut(pieces)
-    await db.steps.bulkPut(steps)
-    await db.anneals.bulkPut(anneals)
-    await db.inspects.bulkPut(inspects)
-  })
+  return { furnaces, batches, pieces, steps, anneals, inspects }
 }
