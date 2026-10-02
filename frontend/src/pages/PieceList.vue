@@ -56,17 +56,20 @@ const batchLabel = computed<Record<string, string>>(() => {
 
 const designCheck = computed(() => checkDesign(form.designHeightMm, form.wallThicknessMm))
 
-const stats = computed(() => ({
-  total: pieceStore.pieces.length,
-  designing: pieceStore.pieces.filter((row) => row.state === '设计中').length,
-  working: pieceStore.pieces.filter((row) => row.state === '制作中').length,
-  annealed: pieceStore.pieces.filter((row) => row.state === '已退火').length,
-  inspected: pieceStore.pieces.filter((row) => row.state === '已检验').length,
-  avgThickness:
-    pieceStore.pieces.length === 0
-      ? 0
-      : Math.round((pieceStore.pieces.reduce((acc, row) => acc + row.wallThicknessMm, 0) / pieceStore.pieces.length) * 100) / 100,
-}))
+const stats = computed(() => {
+  const all = pieceStore.decoratedPieces
+  return {
+    total: all.length,
+    designing: all.filter((row) => row.state === '设计中').length,
+    working: all.filter((row) => row.state === '制作中').length,
+    annealed: all.filter((row) => row.state === '已退火').length,
+    inspected: all.filter((row) => row.state === '已检验').length,
+    avgThickness:
+      all.length === 0
+        ? 0
+        : Math.round((all.reduce((acc, row) => acc + row.wallThicknessMm, 0) / all.length) * 100) / 100,
+  }
+})
 
 onMounted(() => {
   void pieceStore.loadAll()
@@ -128,7 +131,7 @@ async function handleSubmit(): Promise<void> {
 async function handleDelete(row: Piece): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `将删除「${row.name}」及其全部吹制工序、退火与出炉检验记录，且不可恢复。`,
+      `将删除「${row.name}」及其全部吹制工序与出炉检验记录（排产侧窑位编排归排产员，不会被删除），且不可恢复。`,
       '确认删除作品？',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -196,7 +199,7 @@ function handleFilterChange(key: string, value: string): void {
       />
 
       <EmptyPanel
-        v-if="pieceStore.ready && pieceStore.pieces.length === 0"
+        v-if="pieceStore.ready && pieceStore.decoratedPieces.length === 0"
         title="还没有作品"
         description="登记作品名、设计高度、壁厚、工艺与创作者；保存后可直接进入工序编辑，逐道记录温度与时长。"
         action-text="登记第一件作品"

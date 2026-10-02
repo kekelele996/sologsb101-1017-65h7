@@ -1,8 +1,11 @@
 <script setup lang="ts">
 /**
- * /annealing 退火窑位分配与曲线编排
- * 窑位冲突时禁用提交；出炉即回写作品状态为「已退火」。
- * 消费模型：Anneal、Piece、Furnace；复用组件：<FilterBar>、<StatBadge>、<StageTag>、<EmptyPanel>
+ * /annealing 退火窑位分配与曲线编排 —— 窑务排产侧
+ *
+ * 只写排产库（窑位、入窑时间、曲线段）；作品 / 工序来自吹制库只读订阅。
+ * - 前序工序未做完：作品出现在「前序卡点」列表，明确卡在哪一件的哪一道，禁止排位；
+ * - 同一窑位时间窗重叠：指出与哪一件冲突并禁用提交；
+ * - 本侧保存失败按本侧重试，吹制组已确认的工序数据不受影响。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -11,7 +14,6 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
-import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg } from '@/types/anneal'
 import { ANNEAL_CURVE, formatHours, segmentHours, totalAnnealHours } from '@/utils/thermal'
@@ -19,7 +21,6 @@ import { nowLocalInput } from '@/utils/id'
 
 const annealStore = useAnnealStore()
 const pieceStore = usePieceStore()
-const furnaceStore = useFurnaceStore()
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -44,12 +45,15 @@ const rules: FormRules<AnnealDraft> = {
 }
 
 const pieceName = computed<Record<string, string>>(() =>
-  Object.fromEntries(pieceStore.pieces.map((row) => [row.id, `${row.name} · ${row.craft}`]))
+  Object.fromEntries(pieceStore.decoratedPieces.map((row) => [row.id, `${row.name} · ${row.craft}`]))
 )
 
+/** 窑位池：以吹制侧退火窑台账为准，台账未就绪时回退到排侧记录推导 */
 const slotOptions = computed<string[]>(() => {
-  const codes = furnaceStore.annealingFurnaces.map((row) => row.code)
-  if (codes.length === 0) return annealStore.allSlots
+  const codes =
+    annealStore.annealFurnaces.length > 0
+      ? annealStore.annealFurnaces.map((row) => row.code)
+      : annealStore.kilnCodes
   const list: string[] = []
   codes.forEach((code) => {
     for (let index = 0; index < 9; index += 1) {
@@ -59,6 +63,18 @@ const slotOptions = computed<string[]>(() => {
   })
   return list
 })
+
+/** 当前选中作品的前序就绪状态与卡点原因 */
+const selectedReady = computed<boolean>(() =>
+  form.pieceId === '' ? true : annealStore.isPieceReady(form.pieceId)
+)
+const selectedBlockReason = computed<string>(() =>
+  form.pieceId === '' ? '' : annealStore.blockReasonOf(form.pieceId)
+)
+/** 编辑既有记录时允许调整（如推迟入窑时间）；仅新建排位才硬卡前序 */
+const isEdit = computed<boolean>(() => editingId.value !== null)
+/** 提交是否允许：新建必须前序完成且无冲突；编辑只校验时间窗冲突 */
+const submitBlocked = computed<boolean>(() => conflict.value.conflict || (!isEdit.value && !selectedReady.value))
 
 /** 当前表单的窑位冲突检测结果，冲突时禁用提交 */
 const conflict = computed(() =>
@@ -87,18 +103,23 @@ const stats = computed(() => ({
   waiting: annealStore.anneals.filter((row) => row.state === '待入窑').length,
   firing: annealStore.anneals.filter((row) => row.state === '退火中').length,
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
+  ready: annealStore.readyPieces.length,
+  blocked: annealStore.blockedPieces.length,
 }))
 
 onMounted(() => {
   void annealStore.loadAll()
   void pieceStore.loadAll()
-  void furnaceStore.loadAll()
 })
+
+/** 可排作品（工序全部完成、当前未占窑）；未完成的作品在下拉里标灰并禁止选择 */
+const selectablePieces = computed(() => pieceStore.decoratedPieces)
 
 function openCreate(): void {
   editingId.value = null
+  const firstReady = annealStore.readyPieces[0]?.piece.id
   Object.assign(form, {
-    pieceId: pieceStore.currentPieceId ?? pieceStore.pieces[0]?.id ?? '',
+    pieceId: firstReady ?? pieceStore.pieces[0]?.id ?? '',
     kilnSlot: slotOptions.value[0] ?? 'AN-01-A1',
     curveSeg: '缓冷' as CurveSeg,
     inAt: nowLocalInput(),
@@ -125,6 +146,10 @@ async function handleSubmit(): Promise<void> {
   if (formRef.value === undefined) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  if (!isEdit.value && !selectedReady.value) {
+    ElMessage.error(`前序工序未完成，无法新建排位：${selectedBlockReason.value}`)
+    return
+  }
   if (conflict.value.conflict) {
     ElMessage.error(conflict.value.message)
     return
@@ -169,7 +194,7 @@ async function handleDelete(row: Anneal): Promise<void> {
 async function handleAdvance(row: Anneal): Promise<void> {
   const next = await annealStore.advance(row.id)
   if (next === null) {
-    ElMessage.info('该记录已处于「已出炉」状态')
+    ElMessage.info(annealStore.saveError !== '' ? annealStore.lastMessage : '该记录已处于「已出炉」状态')
     return
   }
   ElMessage.success(annealStore.lastMessage)
@@ -180,6 +205,16 @@ function handleFilterChange(key: string, value: string): void {
   if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
   if (key === 'kilnCode') annealStore.setFilters({ kilnCode: value })
 }
+
+/** 从卡点条目直接新建该件作品的排位（若工序刚被吹侧补完即可排） */
+function scheduleFromQueue(pieceId: string): void {
+  if (!annealStore.isPieceReady(pieceId)) {
+    ElMessage.warning(`前序工序未完成，暂不能排位：${annealStore.blockReasonOf(pieceId)}`)
+    return
+  }
+  openCreate()
+  form.pieceId = pieceId
+}
 </script>
 
 <template>
@@ -189,6 +224,8 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="待入窑" :value="stats.waiting" suffix="条" tone="info" icon="DataLine" />
       <StatBadge label="退火中" :value="stats.firing" suffix="条" tone="warning" icon="TrendCharts" />
       <StatBadge label="已出炉" :value="stats.done" suffix="条" tone="success" icon="PieChart" />
+      <StatBadge label="可排作品" :value="stats.ready" suffix="件" tone="success" icon="CircleCheck" />
+      <StatBadge label="前序卡点" :value="stats.blocked" suffix="件" tone="danger" icon="Warning" />
       <StatBadge
         label="窑位占用率"
         :value="`${annealStore.occupancyRate}%`"
@@ -199,8 +236,40 @@ function handleFilterChange(key: string, value: string): void {
       />
     </div>
 
+    <!-- 前序卡点：排产员一眼看到卡在哪一件、哪一道 -->
     <el-alert
-      v-if="annealStore.lastMessage !== ''"
+      v-if="annealStore.blockedPieces.length > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${annealStore.blockedPieces.length} 件作品前序工序未做完，暂不能排入窑位`"
+    >
+      <template #default>
+        <div class="block-list">
+          <div v-for="item in annealStore.blockedPieces" :key="item.piece.id" class="block-item">
+            <el-tag size="small" type="danger" effect="dark">卡点</el-tag>
+            <span class="block-name">{{ item.piece.name }}（{{ item.piece.craft }} · {{ item.piece.artist }}）</span>
+            <span class="block-reason">{{ item.blockReason }}</span>
+            <el-button link type="primary" size="small" @click="$router.push(`/pieces/${item.piece.id}/steps`)">
+              查看工序
+            </el-button>
+          </div>
+        </div>
+      </template>
+    </el-alert>
+
+    <el-alert
+      v-if="annealStore.saveError !== ''"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`排产侧保存失败，可在本侧重试（吹制组数据未受影响）：${annealStore.saveError}`"
+    />
+
+    <el-alert
+      v-else-if="annealStore.lastMessage !== ''"
       type="info"
       show-icon
       :closable="false"
@@ -208,11 +277,28 @@ function handleFilterChange(key: string, value: string): void {
       :title="annealStore.lastMessage"
     />
 
+    <!-- 待排作品：工序全部完成、等窑位 -->
+    <el-card v-if="annealStore.readyPieces.length > 0" shadow="never" class="mb-14">
+      <template #header>
+        <span class="card-header__title">可排窑位的作品（前序工序已全部完成）</span>
+      </template>
+      <div class="ready-grid">
+        <div v-for="item in annealStore.readyPieces" :key="item.piece.id" class="ready-cell">
+          <div class="ready-name">{{ item.piece.name }}</div>
+          <div class="ready-sub">
+            {{ item.piece.craft }} · 壁厚 {{ item.piece.wallThicknessMm }} mm · 全流程
+            {{ annealStore.durationOf(item.piece.id).text }}
+          </div>
+          <el-button size="small" type="primary" plain @click="scheduleFromQueue(item.piece.id)">排入窑位</el-button>
+        </div>
+      </div>
+    </el-card>
+
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
           <span class="card-header__title">退火窑位分配与曲线编排</span>
-          <el-button type="primary" @click="openCreate" :disabled="pieceStore.pieces.length === 0 || slotOptions.length === 0">
+          <el-button type="primary" @click="openCreate" :disabled="selectablePieces.length === 0 || slotOptions.length === 0">
             <el-icon><Plus /></el-icon>
             <span>分配窑位</span>
           </el-button>
@@ -240,7 +326,7 @@ function handleFilterChange(key: string, value: string): void {
       <EmptyPanel
         v-if="annealStore.ready && annealStore.anneals.length === 0"
         title="还没有退火编排"
-        description="为已完成全部工序的作品分配退火窑位与曲线段；同一窑位在时间窗重叠时会禁止提交。"
+        description="为已完成全部工序的作品分配退火窑位、入窑时间与曲线段；前序未完成的作品会在上方卡点列表标出，同一窑位时间窗重叠时禁止提交。"
         action-text="分配第一个窑位"
         @action="openCreate"
       />
@@ -261,7 +347,7 @@ function handleFilterChange(key: string, value: string): void {
         </el-table-column>
         <el-table-column label="阶段" width="150">
           <template #default="{ row }">
-            <StageTag :stage="pieceStore.pieces.find((item) => item.id === row.pieceId)?.state ?? null" size="small" />
+            <StageTag :stage="pieceStore.stateOf(row.pieceId)" size="small" />
           </template>
         </el-table-column>
         <el-table-column prop="kilnSlot" label="窑位" width="130" />
@@ -341,13 +427,24 @@ function handleFilterChange(key: string, value: string): void {
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="作品" prop="pieceId">
-              <el-select v-model="form.pieceId" filterable style="width: 100%">
+              <el-select
+                v-model="form.pieceId"
+                filterable
+                style="width: 100%"
+                :disabled="editingId !== null"
+              >
                 <el-option
-                  v-for="item in pieceStore.pieces"
+                  v-for="item in selectablePieces"
                   :key="item.id"
                   :value="item.id"
                   :label="`${item.name} · ${item.craft} · 壁厚 ${item.wallThicknessMm} mm`"
-                />
+                  :disabled="!isEdit && !annealStore.isPieceReady(item.id)"
+                >
+                  <span>{{ item.name }} · {{ item.craft }} · 壁厚 {{ item.wallThicknessMm }} mm</span>
+                  <el-tag v-if="!annealStore.isPieceReady(item.id)" size="small" type="danger" effect="plain" class="ml-8">
+                    前序未完成
+                  </el-tag>
+                </el-option>
               </el-select>
             </el-form-item>
           </el-col>
@@ -397,12 +494,29 @@ function handleFilterChange(key: string, value: string): void {
           </el-select>
         </el-form-item>
 
+        <!-- 前序未完成：新建硬阻断；编辑既有记录时改为警告（可推迟入窑时间） -->
         <el-alert
-          v-if="conflict.conflict"
+          v-if="!selectedReady && !isEdit"
           type="error"
           show-icon
           :closable="false"
-          title="窑位冲突，无法提交"
+          title="前序工序未完成，无法排入窑位"
+          :description="selectedBlockReason"
+        />
+        <el-alert
+          v-else-if="!selectedReady"
+          type="warning"
+          show-icon
+          :closable="false"
+          title="该件前序工序仍未完成"
+          :description="`${selectedBlockReason} 可以调整窑位 / 推迟入窑时间，但在工序全部完成前不应实际入窑。`"
+        />
+        <el-alert
+          v-else-if="conflict.conflict"
+          type="error"
+          show-icon
+          :closable="false"
+          title="窑位时间窗重叠，无法提交"
           :description="conflict.message"
         />
         <el-alert
@@ -416,7 +530,12 @@ function handleFilterChange(key: string, value: string): void {
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" :disabled="conflict.conflict" @click="handleSubmit">
+        <el-button
+          type="primary"
+          :loading="submitting"
+          :disabled="submitBlocked"
+          @click="handleSubmit"
+        >
           保存
         </el-button>
       </template>
@@ -455,6 +574,60 @@ function handleFilterChange(key: string, value: string): void {
 .cell-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.ml-8 {
+  margin-left: 8px;
+}
+
+.block-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.block-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.block-name {
+  font-weight: 600;
+  color: #2b3a4a;
+}
+
+.block-reason {
+  color: #8a4b39;
+}
+
+.ready-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.ready-cell {
+  border: 1px solid #d9e7da;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #f7fcf8;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ready-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d2b3a;
+}
+
+.ready-sub {
+  font-size: 12px;
+  color: #6b7a89;
 }
 
 .slot-grid {

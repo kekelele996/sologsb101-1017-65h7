@@ -1,6 +1,7 @@
 /**
- * 窑炉与料液状态管理（Pinia）
+ * 窑炉与料液状态管理（Pinia）—— 吹制侧
  * 维护窑炉列表、料液批次及剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
+ * 数据全部来自吹制库 gbglassblow-blow，排产侧对其只读。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -8,17 +9,17 @@ import { liveQuery } from 'dexie'
 import type { Furnace, FurnaceDraft, FurnaceState, FurnaceType } from '../types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '../types/batch'
 import {
-  DB_SCHEMA_VERSION,
-  ROW_REVISION,
+  BLOW_DB_SCHEMA_VERSION,
+  blowDb,
   consumeBatch,
-  countAll,
-  db,
-  initDatabase,
+  countBlow,
+  initBlowDatabase,
   putBatch,
   putFurnace,
   removeBatch,
   removeFurnace,
-} from '../utils/db'
+} from '../utils/blowDb'
+import { ROW_REVISION } from '../utils/ownership'
 import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
@@ -110,14 +111,14 @@ export const useFurnaceStore = defineStore('furnace', () => {
     loading.value = true
     error.value = ''
     try {
-      await initDatabase()
+      await initBlowDatabase()
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
           const [furnaceRows, batchRows, pieceRows] = await Promise.all([
-            db.furnaces.toArray(),
-            db.batches.toArray(),
-            db.pieces.toArray(),
+            blowDb.furnaces.toArray(),
+            blowDb.batches.toArray(),
+            blowDb.pieces.toArray(),
           ])
           return { furnaceRows, batchRows, pieceRows }
         }).subscribe({
@@ -130,14 +131,14 @@ export const useFurnaceStore = defineStore('furnace', () => {
             error.value = ''
           },
           error: (err: unknown) => {
-            error.value = err instanceof Error ? err.message : '读取窑炉数据失败'
+            error.value = err instanceof Error ? err.message : '读取吹制侧窑炉数据失败'
             loading.value = false
           },
         })
       }
       await refreshCounts()
     } catch (err) {
-      error.value = err instanceof Error ? err.message : '初始化本地数据库失败'
+      error.value = err instanceof Error ? err.message : '初始化吹制侧本地数据库失败'
       loading.value = false
     }
   }
@@ -166,7 +167,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
     await putFurnace(row)
     revision.value += 1
     lastMessage.value =
-      row.type === '退火窑' ? `已新建退火窑「${row.code}」，窑位已进入窑位池` : `已新建窑炉「${row.code}」，可挂料液批次`
+      row.type === '退火窑' ? `已新建退火窑「${row.code}」，窑位已进入排产窑位池` : `已新建窑炉「${row.code}」，可挂料液批次`
     return row
   }
 
@@ -188,7 +189,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
     await removeFurnace(furnaceId)
     await refreshCounts()
     revision.value += 1
-    lastMessage.value = '窑炉及其料液批次已删除'
+    lastMessage.value = '窑炉及其料液批次已删除（吹制侧）'
   }
 
   async function createBatch(draft: GlassBatchDraft): Promise<GlassBatch> {
@@ -230,7 +231,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
     revision.value += 1
   }
 
-  /** 取料：按剩余量扣减，返回实际扣减量 */
+  /** 取料：按剩余量扣减，返回实际扣减量；失败仅影响吹制侧，可在本侧重试 */
   async function consume(batchId: string, kg: number): Promise<number> {
     const actual = await consumeBatch(batchId, kg)
     revision.value += 1
@@ -254,8 +255,8 @@ export const useFurnaceStore = defineStore('furnace', () => {
   }
 
   async function refreshCounts(): Promise<void> {
-    const result = await countAll()
-    counts.value = { ...result, schemaVersion: DB_SCHEMA_VERSION }
+    const result = await countBlow()
+    counts.value = { ...result, schemaVersion: BLOW_DB_SCHEMA_VERSION }
   }
 
   return {

@@ -82,7 +82,7 @@ function go(path: string): void {
       </nav>
       <div class="app-header__meta">
         <el-tag v-if="pieceStore.currentPiece" type="warning" effect="dark">
-          当前作品：{{ pieceStore.currentPiece.name }}（{{ pieceStore.currentPiece.state }}）
+          当前作品：{{ pieceStore.currentPiece.name }}（{{ pieceStore.stateOf(pieceStore.currentPiece.id) }}）
         </el-tag>
         <el-tag v-else type="info">未选择作品</el-tag>
         <el-tag v-if="lowRemain > 0" type="danger" effect="dark">待补料 {{ lowRemain }} 批</el-tag>
@@ -96,12 +96,12 @@ function go(path: string): void {
     </main>
 
     <footer class="app-footer">
-      <span>数据仅存于本浏览器（IndexedDB 库名 gbglassblow / localStorage），不上传任何服务器。</span>
+      <span>吹制组与窑务排产员各持一本本地库（gbglassblow-blow / gbglassblow-kiln），互不覆盖；数据仅存于本浏览器，不上传任何服务器。</span>
       <span>
         窑炉 {{ furnaceStore.furnaces.length }} · 料液 {{ furnaceStore.batches.length }} · 作品
-        {{ pieceStore.pieces.length }} · 工序 {{ pieceStore.steps.length }} · 结构版本 v{{
-          furnaceStore.counts.schemaVersion ?? '-'
-        }}
+        {{ pieceStore.pieces.length }} · 工序 {{ pieceStore.steps.length }} · 窑位编排
+        {{ annealStore.anneals.length }} · 结构 v{{ furnaceStore.counts.schemaVersion ?? '-' }} /
+        v{{ annealStore.schemaVersion }}
       </span>
     </footer>
   </div>

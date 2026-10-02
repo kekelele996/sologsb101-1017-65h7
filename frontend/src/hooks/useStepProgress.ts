@@ -5,7 +5,7 @@
 import { computed, onScopeDispose, ref, type ComputedRef, type Ref } from 'vue'
 import { liveQuery } from 'dexie'
 import type { Step } from '../types/step'
-import { db, initDatabase } from '../utils/db'
+import { blowDb, initBlowDatabase } from '../utils/blowDb'
 
 /** 工序进度派生结果 */
 export interface StepProgress {
@@ -107,10 +107,10 @@ export function useStepProgress(pieceId: Ref<string | null> | string | null): Us
   const loading = ref(true)
   const error = ref('')
 
-  void initDatabase()
+  void initBlowDatabase()
   const subscription = liveQuery(async () => {
-    await initDatabase()
-    return db.steps.toArray()
+    await initBlowDatabase()
+    return blowDb.steps.toArray()
   }).subscribe({
     next: (list) => {
       steps.value = list

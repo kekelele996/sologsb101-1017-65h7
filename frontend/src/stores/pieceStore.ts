@@ -1,25 +1,34 @@
 /**
- * 作品与工序状态管理（Pinia）
- * 维护作品列表、当前作品与当前作品的工序；工序状态由 db.syncPieceState 联动作品状态。
+ * 作品与吹制工序状态管理（Pinia）—— 吹制侧
+ *
+ * 写归属（仅吹制库 gbglassblow-blow）：作品登记、工序道次 / 温度 / 时长 / 操作人、
+ * 工序拖拽重排、出炉检验。
+ *
+ * 只读归属：退火窑位编排来自排产库 gbglassblow-kiln，本 store 只订阅不写入；
+ * 作品全流程状态由两侧数据在读取层即时派生（derivePieceState），
+ * 因此排产侧改窑位 / 入窑时间绝不会把吹侧刚填的工序温度、操作人冲回旧值。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Craft, Piece, PieceDraft, PieceState } from '../types/piece'
 import type { Step, StepDraft } from '../types/step'
+import type { Anneal } from '../types/anneal'
+import type { Inspect } from '../types/inspect'
 import {
-  DB_SCHEMA_VERSION,
-  ROW_REVISION,
-  countAll,
-  db,
-  initDatabase,
+  BLOW_DB_SCHEMA_VERSION,
+  blowDb,
+  countBlow,
+  initBlowDatabase,
   putPiece,
   putStep,
   removePiece,
   removeStep,
   reorderSteps,
-  syncPieceState,
-} from '../utils/db'
+} from '../utils/blowDb'
+import { initKilnDatabase, kilnDb } from '../utils/kilnDb'
+import { ROW_REVISION } from '../utils/ownership'
+import { derivePieceState } from '../utils/derivedState'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
 
@@ -51,11 +60,15 @@ function writeCurrentPieceId(id: string | null): void {
   }
 }
 
-let subscribed = false
+let blowSubscribed = false
+let annealSubscribed = false
 
 export const usePieceStore = defineStore('piece', () => {
   const pieces = ref<Piece[]>([])
   const steps = ref<Step[]>([])
+  const inspects = ref<Inspect[]>([])
+  /** 排产侧退火记录（只读，跨库订阅） */
+  const anneals = ref<Anneal[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -65,13 +78,45 @@ export const usePieceStore = defineStore('piece', () => {
   const currentPieceId = ref<string | null>(readCurrentPieceId())
   const filters = reactive<PieceFilters>({ ...EMPTY_FILTERS })
 
+  /* ---------- 跨库只读派生 ---------- */
+
+  function annealsOf(pieceId: string): Anneal[] {
+    return anneals.value.filter((row) => row.pieceId === pieceId)
+  }
+
+  function inspectsOf(pieceId: string): Inspect[] {
+    return inspects.value.filter((row) => row.pieceId === pieceId)
+  }
+
+  /**
+   * 作品全流程状态（跨库即时派生）：
+   * 检验（吹侧）→ 已出炉退火（排侧）→ 有工序（吹侧）→ 设计中。
+   */
+  function stateOf(pieceId: string): PieceState {
+    return derivePieceState(stepsOf(pieceId), annealsOf(pieceId), inspectsOf(pieceId))
+  }
+
+  /** pieceId → 派生状态的映射，供表格 / 标签批量渲染 */
+  const stateMap = computed<Record<string, PieceState>>(() => {
+    const result: Record<string, PieceState> = {}
+    pieces.value.forEach((piece) => {
+      result[piece.id] = stateOf(piece.id)
+    })
+    return result
+  })
+
   const currentPiece = computed<Piece | null>(
     () => pieces.value.find((row) => row.id === currentPieceId.value) ?? null
   )
 
-  const visiblePieces = computed<Piece[]>(() => {
+  /** 附带派生状态的作品视图（列表渲染统一用它，不再读 row.state 旧快照） */
+  const decoratedPieces = computed(() =>
+    pieces.value.map((piece) => ({ ...piece, state: stateOf(piece.id) })),
+  )
+
+  const visiblePieces = computed(() => {
     const keyword = filters.keyword.trim().toLowerCase()
-    return pieces.value.filter((piece) => {
+    return decoratedPieces.value.filter((piece) => {
       if (filters.craft !== 'all' && piece.craft !== filters.craft) return false
       if (filters.state !== 'all' && piece.state !== filters.state) return false
       if (keyword === '') return true
@@ -92,24 +137,35 @@ export const usePieceStore = defineStore('piece', () => {
   }
 
   const inProgressCount = computed<number>(
-    () => pieces.value.filter((row) => row.state === '设计中' || row.state === '制作中').length
+    () => decoratedPieces.value.filter((row) => row.state === '设计中' || row.state === '制作中').length
   )
 
   async function loadAll(): Promise<void> {
     loading.value = true
     error.value = ''
     try {
-      await initDatabase()
-      if (!subscribed) {
-        subscribed = true
+      const blowReady = initBlowDatabase()
+      await blowReady
+      // 排产库仅用于只读订阅退火记录；它打不开不阻断吹侧功能
+      await initKilnDatabase(blowReady).catch(() => undefined)
+
+      if (!blowSubscribed) {
+        blowSubscribed = true
         liveQuery(async () => {
-          const [pieceRows, stepRows] = await Promise.all([db.pieces.toArray(), db.steps.toArray()])
-          return { pieceRows, stepRows }
+          const [pieceRows, stepRows, inspectRows] = await Promise.all([
+            blowDb.pieces.toArray(),
+            blowDb.steps.toArray(),
+            blowDb.inspects.toArray(),
+          ])
+          return { pieceRows, stepRows, inspectRows }
         }).subscribe({
-          next: ({ pieceRows, stepRows }) => {
+          next: ({ pieceRows, stepRows, inspectRows }) => {
             const sorted = [...pieceRows].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
             pieces.value = sorted
-            steps.value = [...stepRows].sort((a, b) => a.pieceId.localeCompare(b.pieceId) || a.seq - b.seq)
+            steps.value = [...stepRows].sort(
+              (a, b) => a.pieceId.localeCompare(b.pieceId) || a.seq - b.seq,
+            )
+            inspects.value = [...inspectRows].sort((a, b) => b.date.localeCompare(a.date))
             loading.value = false
             ready.value = true
             error.value = ''
@@ -120,14 +176,28 @@ export const usePieceStore = defineStore('piece', () => {
             }
           },
           error: (err: unknown) => {
-            error.value = err instanceof Error ? err.message : '读取作品数据失败'
+            error.value = err instanceof Error ? err.message : '读取吹制侧作品数据失败'
             loading.value = false
           },
         })
       }
+
+      if (!annealSubscribed) {
+        annealSubscribed = true
+        liveQuery(() => kilnDb.anneals.toArray()).subscribe({
+          next: (rows) => {
+            anneals.value = rows
+          },
+          error: () => {
+            // 排产库暂不可用时吹侧功能保持可用，退火状态显示为无记录
+            anneals.value = []
+          },
+        })
+      }
+
       await refreshCounts()
     } catch (err) {
-      error.value = err instanceof Error ? err.message : '初始化本地数据库失败'
+      error.value = err instanceof Error ? err.message : '初始化吹制侧本地数据库失败'
       loading.value = false
     }
   }
@@ -144,6 +214,8 @@ export const usePieceStore = defineStore('piece', () => {
   function resetFilters(): void {
     Object.assign(filters, { ...EMPTY_FILTERS })
   }
+
+  /* ------------------------------ 作品（吹侧写） ------------------------------ */
 
   async function createPiece(draft: PieceDraft): Promise<Piece> {
     const stamp = nowIso()
@@ -178,6 +250,7 @@ export const usePieceStore = defineStore('piece', () => {
       wallThicknessMm: draft.wallThicknessMm,
       craft: draft.craft,
       artist: draft.artist.trim(),
+      // 登记时允许手工选择阶段；跨侧推进（退火 / 检验）不再回写覆盖该字段
       state: draft.state,
     })
     revision.value += 1
@@ -188,10 +261,10 @@ export const usePieceStore = defineStore('piece', () => {
     if (currentPieceId.value === pieceId) selectPiece(null)
     await refreshCounts()
     revision.value += 1
-    lastMessage.value = '作品及其工序、退火与检验记录已删除'
+    lastMessage.value = '作品及其吹制工序、检验记录已删除（排产侧窑位编排归排产员，未被删除）'
   }
 
-  /* ------------------------------ 工序 ------------------------------ */
+  /* ------------------------------ 工序（吹侧写） ------------------------------ */
 
   async function createStep(draft: StepDraft): Promise<Step> {
     const stamp = nowIso()
@@ -233,7 +306,7 @@ export const usePieceStore = defineStore('piece', () => {
   async function deleteStep(stepId: string): Promise<void> {
     await removeStep(stepId)
     revision.value += 1
-    lastMessage.value = '工序已删除，作品状态已重新推导'
+    lastMessage.value = '工序已删除（仅吹制侧）'
   }
 
   /** 推进工序状态：未开始 → 进行中 → 已完成 */
@@ -255,7 +328,7 @@ export const usePieceStore = defineStore('piece', () => {
     }`
   }
 
-  /** 拖拽排序：把 fromId 移动到 toId 之前 */
+  /** 拖拽排序：把 fromId 移动到 toId 之前；只重写吹侧工序序号，不触碰排产侧入窑时间 */
   async function moveStepBefore(pieceId: string, fromId: string, toId: string): Promise<void> {
     if (fromId === toId) return
     const list = stepsOf(pieceId)
@@ -266,7 +339,7 @@ export const usePieceStore = defineStore('piece', () => {
     list.splice(toIndex, 0, moved)
     await reorderSteps(list.map((row) => row.id))
     revision.value += 1
-    lastMessage.value = `已调整工序顺序：「${moved.name}」移动到第 ${toIndex + 1} 道`
+    lastMessage.value = `已调整工序顺序：「${moved.name}」移动到第 ${toIndex + 1} 道（排产侧入窑时间不受影响）`
   }
 
   /** 按序号升序重排（拖拽置顶/置底等场景） */
@@ -282,21 +355,17 @@ export const usePieceStore = defineStore('piece', () => {
     lastMessage.value = `已把「${moved.name}」调整到第 ${index + 1} 道`
   }
 
-  /** 依工序与退火记录重新推导作品状态 */
-  async function resyncPieceState(pieceId: string): Promise<void> {
-    const next = await syncPieceState(pieceId)
-    revision.value += 1
-    if (next !== null) lastMessage.value = `作品状态已重新推导为「${next}」`
-  }
-
   async function refreshCounts(): Promise<void> {
-    const result = await countAll()
-    counts.value = { ...result, schemaVersion: DB_SCHEMA_VERSION }
+    const result = await countBlow()
+    counts.value = { ...result, schemaVersion: BLOW_DB_SCHEMA_VERSION }
   }
 
   return {
     pieces,
+    decoratedPieces,
     steps,
+    inspects,
+    anneals,
     loading,
     ready,
     error,
@@ -308,6 +377,10 @@ export const usePieceStore = defineStore('piece', () => {
     currentPiece,
     visiblePieces,
     inProgressCount,
+    stateMap,
+    stateOf,
+    annealsOf,
+    inspectsOf,
     stepsOf,
     progressOf,
     loadAll,
@@ -323,7 +396,6 @@ export const usePieceStore = defineStore('piece', () => {
     advanceStep,
     moveStepBefore,
     moveStepToIndex,
-    resyncPieceState,
     refreshCounts,
   }
 })

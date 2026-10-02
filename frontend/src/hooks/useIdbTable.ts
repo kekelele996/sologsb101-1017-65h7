@@ -4,7 +4,7 @@
  */
 import { liveQuery, type Table } from 'dexie'
 import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
-import { ROW_REVISION } from '../utils/db'
+import { ROW_REVISION } from '../utils/ownership'
 import { nowIso, uuid } from '../utils/id'
 
 /** 所有持久化实体共有的行结构 */

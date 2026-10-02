@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * /export 出炉检验登记与 JSON 结构版本导入导出
- * 判定不合格时生成返工提示并保留原始工序记录；消费 Inspect 及全部模型。
- * 复用组件：<StatBadge>、<EmptyPanel>、<StageTag>、<FilterBar>
+ * /export 出炉检验登记与两侧 JSON 存档
+ *
+ * 出炉检验属于吹制侧（写吹制库）；存档 / 重置按归属拆成吹侧与排侧两套：
+ * 任一侧导入或重置都只动自己那本库，另一侧已确认的数据不受影响。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -14,8 +15,22 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
-import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
+import {
+  BLOW_DB_NAME,
+  BLOW_DB_SCHEMA_VERSION,
+  blowDb,
+  exportBlowSnapshot,
+  importBlowSnapshot,
+  resetBlowDatabase,
+} from '@/utils/blowDb'
+import {
+  KILN_DB_NAME,
+  KILN_DB_SCHEMA_VERSION,
+  exportKilnSnapshot,
+  importKilnSnapshot,
+  resetKilnDatabase,
+} from '@/utils/kilnDb'
+import { exportKilnSnapshotJson, exportBlowSnapshotJson, exportScheduleCsvFile, parseSnapshot } from '@/utils/export'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { INSPECT_RESULT_OPTIONS, type Inspect, type InspectDraft, type InspectResult } from '@/types/inspect'
 import { today } from '@/utils/id'
@@ -25,7 +40,8 @@ const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 const furnaceStore = useFurnaceStore()
 
-const { rows, loading, create, update, remove } = useIdbTable<Inspect>(db.inspects, { sortByUpdatedAt: false })
+// 出炉检验归吹制侧
+const { rows, loading, create, update, remove } = useIdbTable<Inspect>(blowDb.inspects, { sortByUpdatedAt: false })
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -52,7 +68,7 @@ const rules = computed<FormRules<InspectDraft>>(() => ({
 }))
 
 const pieceLabel = computed<Record<string, string>>(() =>
-  Object.fromEntries(pieceStore.pieces.map((row) => [row.id, `${row.name} · ${row.craft}`]))
+  Object.fromEntries(pieceStore.decoratedPieces.map((row) => [row.id, `${row.name} · ${row.craft}`]))
 )
 
 const filtered = computed<Inspect[]>(() => {
@@ -79,7 +95,7 @@ const stats = computed(() => {
     pass,
     defect,
     passPct: total === 0 ? 0 : Math.round((pass / total) * 1000) / 10,
-    inProgress: pieceStore.pieces.filter((row) => row.state === '设计中' || row.state === '制作中').length,
+    inProgress: pieceStore.decoratedPieces.filter((row) => row.state === '设计中' || row.state === '制作中').length,
     occupancyRate: annealStore.occupancyRate,
   }
 })
@@ -151,10 +167,16 @@ async function handleDelete(row: Inspect): Promise<void> {
   ElMessage.success('检验记录已删除')
 }
 
-async function handleExportJson(): Promise<void> {
-  const snapshot = await exportSnapshot()
-  const filename = exportSnapshotJson(snapshot)
-  ElMessage.success(`已导出整库存档 ${filename}`)
+async function handleExportBlowJson(): Promise<void> {
+  const snapshot = await exportBlowSnapshot()
+  const filename = exportBlowSnapshotJson(snapshot)
+  ElMessage.success(`已导出吹制侧存档 ${filename}（不含排产侧窑位编排）`)
+}
+
+async function handleExportKilnJson(): Promise<void> {
+  const snapshot = await exportKilnSnapshot()
+  const filename = exportKilnSnapshotJson(snapshot)
+  ElMessage.success(`已导出排产侧存档 ${filename}（仅含窑位 / 入窑时间 / 曲线段）`)
 }
 
 function handleExportCsv(): void {
@@ -165,6 +187,7 @@ function handleExportCsv(): void {
     pieceStore.steps,
     annealStore.anneals,
     rows.value,
+    (pieceId: string) => pieceStore.stateOf(pieceId),
   )
   ElMessage.success(`已导出窑务排产汇总 ${filename}`)
 }
@@ -174,25 +197,44 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
   if (raw === undefined) return
   const text = await raw.text()
   const result = parseSnapshot(text)
-  if (!result.ok || result.snapshot === null) {
+  if (!result.ok || result.snapshot === null || result.side === null) {
     ElMessage.error(result.message)
     return
   }
-  await importSnapshot(result.snapshot)
-  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
-  ElMessage.success(`导入成功：${result.message}`)
+  if (result.side === 'blow' && 'steps' in result.snapshot) {
+    await importBlowSnapshot(result.snapshot)
+    await Promise.all([pieceStore.loadAll(), furnaceStore.loadAll()])
+  } else if (result.side === 'kiln' && 'anneals' in result.snapshot) {
+    await importKilnSnapshot(result.snapshot)
+    await annealStore.loadAll()
+  }
+  ElMessage.success(result.message)
 }
 
-function handleReset(): void {
+function handleResetBlow(): void {
   ElMessageBox.confirm(
-    '全部窑炉、料液批次、作品、工序、退火与检验记录都会被清空，并重新灌入演示数据。',
-    '确认重置本地数据？',
-    { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' },
+    '将清空吹制侧的窑炉、料液、作品、工序与检验并重新灌入演示数据；排产侧窑位编排保持不变。',
+    '确认重置吹制侧数据？',
+    { type: 'warning', confirmButtonText: '确认重置吹侧', cancelButtonText: '取消' },
   )
     .then(async () => {
-      await resetDatabase()
-      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
-      ElMessage.success('已重置为演示数据')
+      await resetBlowDatabase()
+      await Promise.all([pieceStore.loadAll(), furnaceStore.loadAll()])
+      ElMessage.success('吹制侧已重置为演示数据（排产侧未受影响）')
+    })
+    .catch(() => undefined)
+}
+
+function handleResetKiln(): void {
+  ElMessageBox.confirm(
+    '将清空排产侧全部窑位编排并重新灌入演示退火数据；吹制组的作品与工序保持不变。',
+    '确认重置排产侧数据？',
+    { type: 'warning', confirmButtonText: '确认重置排侧', cancelButtonText: '取消' },
+  )
+    .then(async () => {
+      await resetKilnDatabase()
+      await annealStore.loadAll()
+      ElMessage.success('排产侧已重置为演示数据（吹制侧未受影响）')
     })
     .catch(() => undefined)
 }
@@ -216,12 +258,18 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         icon="PieChart"
       />
       <StatBadge
-        label="数据结构版本"
-        :value="`v${DB_SCHEMA_VERSION}`"
-        :suffix="`· ${DB_NAME}`"
+        label="吹制侧结构版本"
+        :value="`v${BLOW_DB_SCHEMA_VERSION}`"
+        :suffix="BLOW_DB_NAME"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+      />
+      <StatBadge
+        label="排产侧结构版本"
+        :value="`v${KILN_DB_SCHEMA_VERSION}`"
+        :suffix="KILN_DB_NAME"
+        tone="info"
+        icon="Sunrise"
       />
     </div>
 
@@ -246,11 +294,15 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
-          <span class="card-header__title">出炉检验登记与结构版本</span>
+          <span class="card-header__title">出炉检验登记与两侧存档</span>
           <el-space wrap>
-            <el-button @click="handleExportJson">
+            <el-button @click="handleExportBlowJson">
               <el-icon><Download /></el-icon>
-              <span>导出 JSON 存档</span>
+              <span>导出吹侧存档</span>
+            </el-button>
+            <el-button @click="handleExportKilnJson">
+              <el-icon><Download /></el-icon>
+              <span>导出排侧存档</span>
             </el-button>
             <el-button @click="handleExportCsv">
               <el-icon><Download /></el-icon>
@@ -259,10 +311,11 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
             <el-upload :auto-upload="false" :show-file-list="false" accept=".json" :on-change="handleImport">
               <el-button>
                 <el-icon><Upload /></el-icon>
-                <span>导入 JSON 存档</span>
+                <span>导入存档（自动识别归属侧）</span>
               </el-button>
             </el-upload>
-            <el-button type="danger" plain @click="handleReset">重置演示数据</el-button>
+            <el-button type="warning" plain @click="handleResetKiln">重置排侧演示数据</el-button>
+            <el-button type="danger" plain @click="handleResetBlow">重置吹侧演示数据</el-button>
             <el-button type="primary" @click="openCreate" :disabled="pieceStore.pieces.length === 0">
               <el-icon><Plus /></el-icon>
               <span>登记检验</span>
@@ -301,10 +354,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
               <el-link type="primary" @click="router.push(`/pieces/${row.pieceId}/steps`)">
                 {{ pieceLabel[row.pieceId] ?? '（作品已删除）' }}
               </el-link>
-              <StageTag
-                :stage="pieceStore.pieces.find((item) => item.id === row.pieceId)?.state ?? null"
-                size="small"
-              />
+              <StageTag :stage="pieceStore.stateOf(row.pieceId)" size="small" />
             </div>
           </template>
         </el-table-column>
@@ -337,11 +387,11 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
     </el-card>
 
     <el-dialog v-model="dialogVisible" :title="editingId === null ? '登记出炉检验' : '编辑出炉检验'" width="620px">
-      <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
+      <el-form ref={formRef} :model="form" :rules="rules" label-width="120px">
         <el-form-item label="作品" prop="pieceId">
           <el-select v-model="form.pieceId" filterable style="width: 100%">
             <el-option
-              v-for="item in pieceStore.pieces"
+              v-for="item in pieceStore.decoratedPieces"
               :key="item.id"
               :value="item.id"
               :label="`${item.name} · ${item.craft} · ${item.state}`"
@@ -380,7 +430,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
           type="warning"
           show-icon
           :closable="false"
-          :title="`判定为「${form.result}」将生成返工提示`"
+          title="判定为「裂纹 / 气泡 / 变形」将生成返工提示"
           description="原始吹制工序记录会完整保留，返工后可在工序页重新推进状态并再次入窑退火。"
         />
         <el-alert
@@ -389,7 +439,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
           show-icon
           :closable="false"
           title="合格归档"
-          description="检验合格后作品状态会自动回写为「已检验」。"
+          description="检验登记后作品全流程状态由两侧数据自动派生为「已检验」，不会覆盖排产侧任何数据。"
         />
       </el-form>
       <template #footer>

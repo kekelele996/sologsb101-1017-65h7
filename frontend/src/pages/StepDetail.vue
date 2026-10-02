@@ -24,6 +24,8 @@ const furnaceStore = useFurnaceStore()
 
 const pieceId = computed<string>(() => String(route.params.id ?? ''))
 const piece = computed(() => pieceStore.pieces.find((row) => row.id === pieceId.value) ?? null)
+/** 跨库派生的全流程状态（退火 / 检验由排侧与吹侧只读数据拼出） */
+const derivedState = computed(() => pieceStore.stateOf(pieceId.value))
 const { progress } = useStepProgress(pieceId)
 
 const dialogVisible = ref(false)
@@ -158,7 +160,14 @@ async function handleDrop(targetId: string): Promise<void> {
 
 async function handleCopyCard(): Promise<void> {
   if (piece.value === null) return
-  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [])
+  const text = buildStepCardText(
+    piece.value,
+    batch.value,
+    furnace.value,
+    steps.value,
+    pieceStore.annealsOf(piece.value.id),
+    derivedState.value,
+  )
   const ok = await copyText(text)
   ElMessage[ok ? 'success' : 'warning'](ok ? '工序卡片已复制到剪贴板' : '当前浏览器不支持剪贴板写入')
 }
@@ -182,7 +191,7 @@ function goAnnealing(): void {
     >
       <template #extra>
         <el-space wrap>
-          <StageTag v-if="piece" :stage="piece.state" :craft="piece.craft" />
+          <StageTag v-if="piece" :stage="derivedState" :craft="piece.craft" />
           <el-tag v-if="furnace" type="info">{{ furnace.code }} · 上限 {{ furnace.maxTempC }} ℃</el-tag>
           <el-tag v-if="batch" type="success">{{ batch.colorCode }} · 余 {{ batch.remainKg }} kg</el-tag>
           <el-tag v-if="piece" type="warning">理论退火 {{ formatHours(totalAnnealHours(piece.wallThicknessMm)) }}</el-tag>
